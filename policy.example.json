@@ -1,0 +1,12 @@
+{
+  "memory_max": 2147483648,
+  "memory_high": 1073741824,
+  "tasks_max": 128,
+  "cpu_percent": 200,
+  "runtime_seconds": 900,
+  "stop_seconds": 3,
+  "io_read_bytes_per_second": 52428800,
+  "io_write_bytes_per_second": 26214400,
+  "io_device": "/dev/REPLACE_ME",
+  "require_io": false
+}

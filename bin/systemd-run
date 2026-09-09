@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+"""Keep supported legacy scope wrappers inside the resguard job."""
+import os
+from pathlib import Path
+import sys
+
+os.execv('/usr/bin/python3', ['/usr/bin/python3',
+         str(Path(__file__).resolve().parent.parent / 'guard.py'), 'nested-scope', *sys.argv[1:]])
