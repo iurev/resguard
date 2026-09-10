@@ -9,7 +9,17 @@ This is a local command hook and CLI, not an MCP server or an always-on watcher.
 A `PreToolUse` command hook rewrites shell calls to a runner. Before executing
 the original command, the runner creates a systemd user service and verifies
 the actual cgroup limits. A shared `resguard.slice` constrains the aggregate
-resource usage of intercepted jobs for the account.
+resource usage of intercepted jobs for the account. Per-command memory, CPU and
+task limits are separate from the aggregate pool limits, so several legitimate
+services do not all compete inside one command's budget.
+
+Final accounting runs in a separate, transient `resguardlog.slice`, not in
+the workload's shutdown hook. Slow or failed accounting cannot turn a successful
+command into a workload timeout. The logger has a 30-second deadline, 64 MiB
+memory/25% CPU/8-task limits per job, and a shared 256 MiB/100% CPU/64-task
+ceiling, with no swap. These small accounting budgets are separate from workload
+limits; Codex itself is unchanged. The workload still has a three-second stop
+grace. No always-on logging daemon is installed.
 
 - Memory maximum/high watermark, zero swap, CPU quota and process/thread limit.
 - Command deadline and cleanup of background/detached descendants in the job.
@@ -50,7 +60,13 @@ install -m 755 bin/resguard "$RESGUARD_ACCOUNT_HOME/.local/bin/resguard"
 
 Keep `.local/bin` on the account's `PATH`. For upgrades, back up the installed
 runtime first and keep the existing policy, hook configuration and audit history.
-Do not blindly overwrite an existing installation or run an upgrade during jobs.
+Do not blindly overwrite an existing installation. Prefer upgrading between
+jobs. This accounting fix preserves the legacy `finalize` entry point and request
+format, so an atomic single-file replacement of `guard.py` is also compatible
+with in-flight jobs. Existing units keep their old shutdown configuration until
+they finish; newly launched commands use separate accounting immediately. Do
+not stop running workloads merely to upgrade. Preserve a rollback copy and
+replace a fully written same-directory staging file atomically, not in place.
 
 Create `.config/resguard/policy.json` in that account home from
 [`policy.example.json`](policy.example.json). The example limits are starting
@@ -59,6 +75,15 @@ the appropriate existing local block device and choose budgets for the host.
 Even with `require_io=false`, the current runner requires an existing device.
 With `require_io=false`, missing I/O delegation permits execution without disk
 throttling; use `true` if lack of disk throttling must block commands.
+
+`memory_max`, `memory_high`, `tasks_max`, `cpu_percent`, and the two I/O
+bandwidth fields apply to each command tree. Their `aggregate_` counterparts
+apply to the shared workload slice. Aggregate values must be at least as large
+as their per-command values.
+Policies without aggregate keys remain compatible and use the per-command
+values for the shared slice; add explicit aggregate values to avoid that old,
+more restrictive behavior. Environment overrides only tighten per-command
+limits and never rewrite the shared pool.
 
 Merge this entry into the user-level Codex `hooks.json`, preserving unrelated
 hooks. Replace `ABSOLUTE_ACCOUNT_HOME` with the account's actual home directory:
@@ -99,6 +124,16 @@ resguard report --last 20
 resguard logs
 ```
 
+Accounting is registered with the workload in one `StartTransientUnit` call,
+using an auxiliary unit and both `OnSuccess`/`OnFailure`. It survives outer-runner
+cancellation. The runner waits for its independently bounded outcome; accounting
+failure produces a warning, not a replacement command exit code. Check the
+named `resguardlog-<job>.service` in the user journal for accounting failures.
+Unlogged launched-job metadata stays in private `pending/` for diagnosis; only
+abandoned, never-launched hook requests are automatically swept. Storage failure
+can still prevent persistence: this is not a lossless guarantee on broken/full
+storage. Secondary `return` records are best-effort; `finish` is authoritative.
+
 `status` checks configuration, controller delegation and hook discovery/trust
 for the current directory; it is not an end-to-end enforcement test. Each worker
 independently checks its kernel limits before running a command. `logs` prints
@@ -117,6 +152,17 @@ terminal-resize test. Integration probes use tighter per-job ceilings and write
 records to the account's private state. The memory fixture allocates at most
 192 MiB against a 128 MiB limit; it is not an unbounded stress test. Keep the
 test runner resource-limited as well. Testing should not overlap other heavy jobs.
+
+Final-accounting regressions use private temporary state and finite sleep
+delays, without filling RAM or locking the installed audit log. They verify
+slow/failed logging, real runtime and descendant-cleanup timeouts, outer-runner
+death, independent kernel accounting limits, unit collection, and legacy
+finalizer compatibility.
+
+When other guarded jobs are busy, run `/usr/bin/python3 -B test_isolated.py`
+from the checkout instead. It creates private source/state fixtures and an
+independent 512 MiB test-job budget with a 128 MiB test harness. Installed
+policy, hooks, and existing workloads are not changed.
 
 For isolated audit tests from this checkout:
 

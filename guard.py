@@ -33,6 +33,9 @@ ROOT = ACCOUNT_HOME  # Default diagnostic/test cwd; never the source checkout.
 POLICY = ACCOUNT_HOME / '.config/resguard/policy.json'
 STATE = ACCOUNT_HOME / '.local/state/resguard'
 SLICE = 'resguard.slice'
+# No hyphen: resguard-log.slice would be a CHILD of the workload slice.
+LOG_SLICE = 'resguardlog.slice'
+LOG_TIMEOUT_SECONDS = 30
 PREFIX = 'resguard-'
 PYTHON = '/usr/bin/python3'
 MAX_LOG = 10 * 1024 * 1024
@@ -46,14 +49,14 @@ def setup_state():
     (STATE / 'pending').mkdir(exist_ok=True, mode=0o700)
 
 
-def event(kind, **data):
+def event(kind, *, _nonblocking=False, **data):
     setup_state()
     record = dict(time=datetime.datetime.now(datetime.timezone.utc).isoformat(), event=kind, **data)
     # One inter-process lock also protects rotation. All command/resource
     # metadata is retained indefinitely, but not stdout/stderr/environment.
     # Command text is private (0600). Archives are never automatically deleted.
     with (STATE / 'log.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if _nonblocking else 0))
         path = STATE / 'events.jsonl'
         if path.exists() and path.stat().st_size >= MAX_LOG:
             archive_log(path)
@@ -74,9 +77,24 @@ def load_policy():
             raise ValueError(f'Invalid positive policy value: {name}')
     if p['memory_high'] > p['memory_max']:
         raise ValueError('memory_high exceeds memory_max')
+    aggregate = aggregate_policy(p)
+    if aggregate['memory_high'] > aggregate['memory_max']:
+        raise ValueError('aggregate_memory_high exceeds aggregate_memory_max')
+    for name in ('memory_max', 'memory_high', 'tasks_max', 'cpu_percent'):
+        if aggregate[name] < p[name]:
+            raise ValueError(f'aggregate_{name} is lower than per-command {name}')
     if type(p['require_io']) is not bool:
         raise ValueError('require_io must be a boolean')
     return p
+
+
+def aggregate_policy(p):
+    """Return shared-slice limits, preserving old policies as safe defaults."""
+    aggregate = p.copy()
+    for name in ('memory_max', 'memory_high', 'tasks_max', 'cpu_percent',
+                 'io_read_bytes_per_second', 'io_write_bytes_per_second'):
+        aggregate[name] = p.get('aggregate_' + name, p[name])
+    return aggregate
 
 
 def lower_limits(p):
@@ -111,7 +129,10 @@ def hook():
         for item in (STATE / 'pending').glob('*.json'):
             try:
                 if time.time() - item.stat().st_mtime > 86400:
-                    item.unlink(missing_ok=True)
+                    # Keep launched jobs whose final audit could not be written.
+                    # Only abandoned hook requests are safe to sweep.
+                    if 'unit' not in json.loads(item.read_text()):
+                        item.unlink(missing_ok=True)
             except FileNotFoundError:
                 pass
         sweep.touch()
@@ -164,17 +185,18 @@ def resource_properties(p):
 def ensure_slice(bus, mgr, p):
     import dbus as d
     # Concurrent launches share one policy budget. No caps on Codex's group.
+    aggregate = aggregate_policy(p)
     with (STATE / 'slice.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            mgr.StartTransientUnit(SLICE, 'fail', resource_properties(p) + [
+            mgr.StartTransientUnit(SLICE, 'fail', resource_properties(aggregate) + [
                 ('Description', 'resguard user-wide Codex command budget'), ('AddRef', True)],
                 d.Array([], signature='(sa(sv))'))
         except d.DBusException as exc:
             if exc.get_dbus_name() != 'org.freedesktop.systemd1.UnitExists':
                 raise
             mgr.RefUnit(SLICE)
-            mgr.SetUnitProperties(SLICE, True, resource_properties(p))
+            mgr.SetUnitProperties(SLICE, True, resource_properties(aggregate))
 
 
 def measurements(bus, mgr, unit):
@@ -190,6 +212,53 @@ def measurements(bus, mgr, unit):
     start, end = int(v.get('ExecMainStartTimestampMonotonic', 0)), int(v.get('ExecMainExitTimestampMonotonic', 0))
     result['duration_seconds'] = (end-start)/1e6 if start and end >= start else None
     return result
+
+
+def accounting_resources(aggregate=False):
+    import dbus as d
+    return [
+        ('MemoryAccounting', True), ('TasksAccounting', True),
+        ('MemoryMax', d.UInt64((256 if aggregate else 64) * 1024**2)),
+        ('MemorySwapMax', d.UInt64(0)),
+        ('TasksMax', d.UInt64(64 if aggregate else 8)),
+        ('CPUQuotaPerSecUSec', d.UInt64(1000000 if aggregate else 250000)),
+        ('CPUQuotaPeriodUSec', d.UInt64(100000)),
+    ]
+
+
+def ensure_accounting_slice(mgr):
+    import dbus as d
+    with (STATE / 'slice.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            mgr.StartTransientUnit(LOG_SLICE, 'fail', accounting_resources(True) + [
+                ('Description', 'resguard bounded final accounting'), ('AddRef', True)],
+                d.Array([], signature='(sa(sv))'))
+        except d.DBusException as exc:
+            if exc.get_dbus_name() != 'org.freedesktop.systemd1.UnitExists':
+                raise
+            mgr.RefUnit(LOG_SLICE)
+            mgr.SetUnitProperties(LOG_SLICE, True, accounting_resources(True))
+
+
+def accounting_properties(req):
+    import dbus as d
+    argv = [PYTHON, str(HERE / 'guard.py'), 'collect', req['id']]
+    return accounting_resources() + [
+        ('Description', f'resguard accounting {req["id"]}'),
+        ('Slice', LOG_SLICE), ('Type', 'oneshot'), ('AddRef', True),
+        ('CollectMode', 'inactive-or-failed'),
+        # This dependency also retains workload statistics while accounting runs.
+        ('After', d.Array([req['unit']], signature='s')),
+        ('TimeoutStartUSec', d.UInt64(LOG_TIMEOUT_SECONDS * 1000000)),
+        ('TimeoutStopUSec', d.UInt64(3000000)),
+        ('KillMode', 'control-group'), ('OOMPolicy', 'kill'),
+        ('LimitCORE', d.UInt64(0)), ('LimitCORESoft', d.UInt64(0)),
+        ('UMask', d.UInt32(0o077)),
+        ('StandardInput', 'null'), ('StandardOutput', 'journal'),
+        ('StandardError', 'journal'),
+        ('ExecStartEx', d.Array([(PYTHON, argv, ['no-env-expand'])], signature='(sasas)')),
+    ]
 
 
 def current_cgroup():
@@ -214,15 +283,21 @@ def check_limits(req):
         raise RuntimeError('Group OOM kill is not enabled')
     actual['cpu.max'] = (cg / 'cpu.max').read_text().strip()
     # Validate the aggregate budget, not merely one job's limits.
-    base = load_policy()
-    for name, desired in [('memory.max', base['memory_max']), ('memory.high', base['memory_high']), ('memory.swap.max', 0),
-                          ('pids.max', base['tasks_max'])]:
+    # New launchers snapshot this with the command request so a later policy
+    # edit cannot make a running worker validate against unrelated values.
+    # The fallback keeps pre-upgrade pending requests compatible.
+    aggregate = req.get('aggregate_limits', aggregate_policy(load_policy()))
+    for name, desired in [('memory.max', aggregate['memory_max']),
+                          ('memory.high', aggregate['memory_high']), ('memory.swap.max', 0),
+                          ('pids.max', aggregate['tasks_max'])]:
         v = (cg.parent / name).read_text().strip()
-        if v == 'max' or int(v) > desired:
-            raise RuntimeError(f'Aggregate {name} not enforced')
-    for group, policy in ((cg, p), (cg.parent, base)):
+        if v == 'max' or int(v) != desired:
+            raise RuntimeError(f'Aggregate {name} is {v}, expected {desired}')
+    for group, policy, exact in ((cg, p, False), (cg.parent, aggregate, True)):
         quota, period = (group/'cpu.max').read_text().split()
-        if quota == 'max' or int(quota) / int(period) > policy['cpu_percent'] / 100:
+        ratio = None if quota == 'max' else int(quota) / int(period)
+        desired = policy['cpu_percent'] / 100
+        if ratio is None or (ratio != desired if exact else ratio > desired):
             raise RuntimeError(f'CPU quota not enforced in {group}')
     actual['io.max'] = (cg / 'io.max').read_text().strip() if (cg/'io.max').exists() else None
     device = os.stat(p['io_device']).st_rdev
@@ -240,7 +315,7 @@ def check_limits(req):
                            [('rbps', 'io_read_bytes_per_second'), ('wbps', 'io_write_bytes_per_second')])
         return False
 
-    actual['io_active'] = io_enforced(cg, p) and io_enforced(cg.parent, base)
+    actual['io_active'] = io_enforced(cg, p) and io_enforced(cg.parent, aggregate)
     if p['require_io'] and not actual['io_active']:
         raise RuntimeError('io controller is not delegated; administrator setup required')
     event('ready', id=req['id'], unit=req['unit'], cgroup=str(cg), effective=actual)
@@ -266,24 +341,33 @@ def run(job, shell):
     original_umask = os.umask(0o077)
     setup_state()
     req = json.loads(pending(job).read_text())
-    p = lower_limits(load_policy())
+    base = load_policy()
+    p = lower_limits(base)
+    aggregate = aggregate_policy(base)
     # Preserve the shell tool's selection; fail closed for unsupported shells.
     resolved = Path(shell) if shell.startswith('/') else Path('/bin') / shell
     if resolved.name not in ('bash', 'zsh', 'sh', 'dash') or not resolved.is_file():
         raise ValueError(f'Unsupported shell {shell!r}; use bash or zsh')
     unit = PREFIX + job + '.service'
-    req.update(unit=unit, cwd=os.getcwd(), shell=str(resolved), limits=p, runner_pid=os.getpid())
+    audit_unit = 'resguardlog-' + job + '.service'
+    req.update(unit=unit, audit_unit=audit_unit, cwd=os.getcwd(), shell=str(resolved),
+               limits=p, aggregate_limits=aggregate, runner_pid=os.getpid())
     pending(job).write_text(json.dumps(req))
     event('launch', **req)
     DBusGMainLoop(set_as_default=True)
     bus, mgr = connection()
-    ensure_slice(bus, mgr, load_policy())
+    ensure_slice(bus, mgr, base)
+    ensure_accounting_slice(mgr)
     loop = GLib.MainLoop()
     final = {}
+    audit_final = {}
+    audit_deadline = None
+    poll_source = None
     started = False
     start_finished = False
 
     def check_state(*unused):
+        nonlocal audit_deadline, poll_source
         if not started or not start_finished:
             return
         try:
@@ -293,9 +377,27 @@ def run(job, shell):
                 if state == 'inactive' and not m['exit_code_kind'] and m['result'] == 'success':
                     return  # StartTransientUnit has queued, not yet executed, the start job.
                 final.update(m)
-                loop.quit()
+                if audit_deadline is None:
+                    audit_deadline = time.monotonic() + LOG_TIMEOUT_SECONDS + 8
+                    poll_source = GLib.timeout_add(250, poll_state)
+                # Logging has its own deadline and cannot alter the workload
+                # result. Wait for its bounded outcome to make failures visible.
+                audit_state = str(properties(bus, mgr, audit_unit, UNIT_IF)['ActiveState'])
+                a = measurements(bus, mgr, audit_unit)
+                if audit_state in ('inactive', 'failed') and (
+                        a['exit_code_kind'] or a['result'] != 'success'):
+                    audit_final.update(a)
+                    loop.quit()
+                elif time.monotonic() >= audit_deadline:
+                    audit_final['result'] = 'accounting-deadline'
+                    loop.quit()
         except d.DBusException:
             loop.quit()
+
+    def poll_state():
+        # Poll only during bounded accounting, never for the workload lifetime.
+        check_state()
+        return True
 
     mgr.Subscribe()
     receiver = bus.add_signal_receiver(check_state, signal_name='PropertiesChanged',
@@ -324,7 +426,6 @@ def run(job, shell):
     # FD passing keeps stdin/stdout streaming and avoids buffering unlimited
     # output in the runner. ExecStartEx disables systemd's $VAR substitution.
     argv = [PYTHON, str(HERE / 'guard.py'), 'worker', job, '--shell', str(resolved)]
-    finalize_argv = [PYTHON, str(HERE / 'guard.py'), 'finalize', job]
     props = resource_properties(p) + [
         ('Description', f'Codex command {job}'), ('Slice', SLICE),
         ('Type', 'exec'), ('AddRef', True), ('CollectMode', 'inactive-or-failed'),
@@ -339,7 +440,8 @@ def run(job, shell):
         ('ExtraFileDescriptors', d.Array([(d.types.UnixFd(parent_fd), 'guard-parent'),
                                          (d.types.UnixFd(environment_fd), 'guard-environment')], signature='(hs)')),
         ('ExecStartEx', d.Array([(PYTHON, argv, ['no-env-expand'])], signature='(sasas)')),
-        ('ExecStopPostEx', d.Array([(PYTHON, finalize_argv, ['no-env-expand'])], signature='(sasas)')),
+        ('OnSuccess', d.Array([audit_unit], signature='s')),
+        ('OnFailure', d.Array([audit_unit], signature='s')),
     ]
 
     def cancel(signum, frame):
@@ -358,26 +460,44 @@ def run(job, shell):
 
     old_handlers = {}
     try:
-        start_job = mgr.StartTransientUnit(unit, 'fail', props, d.Array([], signature='(sa(sv))'))
+        # Load the handler in the same transaction, before the workload starts.
+        # It still runs if this outer runner is killed or its terminal disappears.
+        auxiliary = d.Array([(audit_unit, accounting_properties(req))], signature='(sa(sv))')
+        start_job = mgr.StartTransientUnit(unit, 'fail', props, auxiliary)
         started = True
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             old_handlers[sig] = signal.signal(sig, cancel)
         old_handlers[signal.SIGWINCH] = signal.signal(signal.SIGWINCH, resize)
         check_state()
-        if not final:
+        if not audit_final and not final.get('result', '').startswith('start-'):
             loop.run()
         if not final:
             raise RuntimeError('Lost systemd service result')
         rc = exit_status(final)
-        event('return', id=job, unit=unit, returned_exit=rc, **final)
+        audit_result = audit_final.get('result', 'unavailable')
+        # The finish record is authoritative. Never wait on a stalled logger's
+        # lock here, or turn a secondary audit-write failure into command125.
+        if audit_result == 'success':
+            try:
+                event('return', _nonblocking=True, id=job, unit=unit, returned_exit=rc,
+                      audit_unit=audit_unit, audit_result=audit_result, **final)
+            except Exception as exc:
+                print(f'[resguard] WARNING: return audit unavailable ({type(exc).__name__}); '
+                      'workload exit preserved; see the final accounting record.', file=sys.stderr)
         # Always make duration and kill reason available in the shell result.
         print(f'\n[resguard] id={job} result={final["result"]} exit={rc} '
               f'wall={final["duration_seconds"]}s cpu_ns={final["cpu_ns"]} '
               f'peak_bytes={final["memory_peak_bytes"]}', file=sys.stderr, flush=True)
         if final['result'] in ('oom-kill', 'timeout'):
             print('[resguard] Worker stopped; retry a smaller task or lower concurrency.', file=sys.stderr)
+        if audit_result != 'success':
+            print(f'[resguard] WARNING: final accounting {audit_result}; workload exit '
+                  f'{rc} preserved. Metadata retained; inspect journal for {audit_unit}.',
+                  file=sys.stderr, flush=True)
         return rc
     finally:
+        if poll_source is not None:
+            GLib.source_remove(poll_source)
         for sig, old in old_handlers.items():
             signal.signal(sig, old)
         receiver.remove()
@@ -388,6 +508,8 @@ def run(job, shell):
             if not final:
                 mgr.StopUnit(unit, 'replace')
             mgr.UnrefUnit(unit)
+            mgr.UnrefUnit(audit_unit)
+        mgr.UnrefUnit(LOG_SLICE)
         mgr.UnrefUnit(SLICE)
         bus.close()
 
@@ -578,8 +700,8 @@ def nested_scope(argv):
 
 
 def finalize(job):
-    # Runs on unit success, failure, timeout, OOM and cancellation; even when
-    # the waiting outer runner has died. This is inside the metered cgroup.
+    # Compatibility for already-running units created by older installations.
+    # New jobs use collect() in a separate service, never ExecStopPost.
     req = json.loads(pending(job).read_text())
     bus, mgr = connection()
     m = measurements(bus, mgr, req['unit'])
@@ -592,6 +714,34 @@ def finalize(job):
     return 0
 
 
+def collect(job):
+    req = json.loads(pending(job).read_text())
+    cg = current_cgroup()
+    if cg.name != req['audit_unit'] or cg.parent.name != LOG_SLICE:
+        raise RuntimeError('Final accounting is not in its independent cgroup')
+    # systemd may omit MONITOR_* when a handler has multiple trigger
+    # dependencies (including both success and failure). The retained source
+    # unit's properties are authoritative; do not depend on those variables.
+    if os.environ.get('MONITOR_UNIT', req['unit']) != req['unit']:
+        raise RuntimeError('Unexpected final accounting trigger')
+    bus, mgr = connection()
+    try:
+        m = measurements(bus, mgr, req['unit'])
+        if str(properties(bus, mgr, req['unit'], UNIT_IF)['ActiveState']) not in ('inactive', 'failed'):
+            raise RuntimeError('Accounting started before workload cleanup completed')
+        status = str(m['exit_status'])
+        if m['exit_code_kind'] in (2, 3):
+            status = signal.Signals(m['exit_status']).name.removeprefix('SIG')
+        event('finish', id=job, unit=req['unit'], session_id=req['session_id'],
+              audit_unit=req['audit_unit'],
+              service_exit_code={1: 'exited', 2: 'killed', 3: 'dumped'}.get(m['exit_code_kind']),
+              service_exit_status=status, **m)
+        pending(job).unlink(missing_ok=True)
+    finally:
+        bus.close()
+    return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'nested-scope':
         try:
@@ -600,7 +750,7 @@ def main():
             print(f'[resguard] nested systemd-run refused: {exc}', file=sys.stderr)
             return 125
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['hook', 'run', 'worker', 'finalize', 'logs'])
+    parser.add_argument('mode', choices=['hook', 'run', 'worker', 'finalize', 'collect', 'logs'])
     parser.add_argument('job', nargs='?')
     parser.add_argument('--shell', default='/bin/bash')
     args = parser.parse_args()
@@ -612,7 +762,8 @@ def main():
             return 0
         return {'run': lambda: run(args.job, args.shell),
                 'worker': lambda: worker(args.job, args.shell),
-                'finalize': lambda: finalize(args.job)}[args.mode]()
+                'finalize': lambda: finalize(args.job),
+                'collect': lambda: collect(args.job)}[args.mode]()
     except Exception as exc:
         reason = f'resguard {args.mode} failed: {type(exc).__name__}: {exc}'
         try:
