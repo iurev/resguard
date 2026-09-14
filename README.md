@@ -1,6 +1,7 @@
 # resguard
 
-Linux resource limits for Codex shell commands, with permanent local audit logs.
+Linux resource limits for agent shell commands (Codex, pi), with permanent local
+audit logs.
 Codex itself remains uncapped, and its dangerous-mode permissions are unchanged.
 This is a local command hook and CLI, not an MCP server or an always-on watcher.
 
@@ -138,6 +139,31 @@ storage. Secondary `return` records are best-effort; `finish` is authoritative.
 for the current directory; it is not an end-to-end enforcement test. Each worker
 independently checks its kernel limits before running a command. `logs` prints
 the private log location. OOM returns 137, timeout 124, and runner failure 125.
+
+### pi extension
+
+The optional [`resguard.ts`](resguard.ts) extension guards the pi coding
+agent's model-driven `bash` tool through the same installed trampoline. On
+every `bash` tool call it sends the PreToolUse payload to `hook.py`, replaces
+the command with the returned rewrite, or blocks the call when the guard
+denies it or is unavailable. It fails closed and keeps the transcript showing
+the original command; only execution is wrapped. The account home is resolved
+at load time, so install the runtime above under the same account that runs
+pi. Guarded jobs use the shared audit log, correlated by pi session and
+tool-call identifiers.
+
+Install it as that account:
+
+```sh
+install -d -m 700 "$RESGUARD_ACCOUNT_HOME/.pi/agent/extensions"
+install -m 644 resguard.ts "$RESGUARD_ACCOUNT_HOME/.pi/agent/extensions/resguard.ts"
+```
+
+pi auto-discovers extensions in that directory: new sessions load it at
+startup, running sessions need `/reload`. Scope matches the Codex `^Bash$`
+matcher: the model's `bash` tool only. User-typed shell escapes and other
+tools are not intercepted. Verify with a trivial prompt that runs `echo`
+through the `bash` tool, then `resguard report --last 1`.
 
 ## Verification
 
